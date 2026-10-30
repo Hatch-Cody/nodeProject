@@ -1,64 +1,225 @@
+
+"use strict";
+
 const { Pool } = require("pg");
-const connectionString = process.env.DATABASE_URL || "postgres:DATABASE_URL='postgres://goeypdkadrxduh:327642ad3e9ef95c812930e959a453ea3c9aecba9f9d9fe7a8ce30e5f870615f@ec2-23-21-129-125.compute-1.amazonaws.com:5432/d24d6m55cc4on5?ssl=true'";
+const argon2 = require("argon2");
 
-const pool = new Pool({ connectionString: connectionString });
-
-function handleLogin(name, pass, callback) {
-
-    console.log('Logging in a user...');
-
-    const sql = 'SELECT username, password FROM users WHERE username = $1';
-    const params = [name];
-
-    // This runs the query, and then calls the callback function with the results.
-    pool.query(sql, params, function (err, result) {
-        // If an error occurred...
-        if (err) {
-            console.log("Error in query: ")
-            console.log(err);
-            callback(err, null);
-
-        } else if (result.rows == "") {
-            error = "Invalid username or password";
-            callback(error, null);
-
-        } else {
-            console.log('Successfully queried user')
-
-            if (result.rows[0].username == name && result.rows[0].password == pass) {
-
-                callback(null, result.rows);
-
-            } else {
-                error = "Invalid username or password";
-
-                callback(null, result);
-            }
-        }
-    });
+// Require database credentials from environment variables.
+if (!process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL environment variable is required");
 }
 
-function registerUser(params, callback) {
-    console.log('Registering new user...');
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    connectionTimeoutMillis: 5000,
+    idleTimeoutMillis: 30000,
+    max: 10
+});
 
-    const sql = 'INSERT INTO users(username, password, email) VALUES($1, $2, $3)'; // RETURNING *';
+// Argon2id password hashing configuration.
+const hashOptions = {
+    type: argon2.argon2id,
+    memoryCost: 19456,
+    timeCost: 2,
+    parallelism: 1
+};
 
-    // This runs the query, and then calls the callback function with the results.
-    pool.query(sql, params, function (err, result) {
-        // If an error occurred...
-        if (err) {
-            console.log("Error in query: ")
-            console.log(err);
-            callback(err, null);
+// Used to reduce timing differences for nonexistent users.
+const dummyHashPromise = argon2.hash(
+    "dummy-password-for-verification",
+    hashOptions
+);
 
-        } else {
-                callback(null, result);
+function authenticationError() {
+    const error = new Error("Invalid username or password");
+    error.code = "AUTH_FAILED";
+    return error;
+}
+
+/**
+ * Authenticate an existing user.
+ *
+ * @param {string} name - Username
+ * @param {string} pass - Plaintext password provided at login
+ * @param {function} callback - callback(error, user)
+ */
+async function handleLogin(name, pass, callback) {
+    if (typeof callback !== "function") {
+        throw new TypeError("Callback must be a function");
+    }
+
+    // Validate input before querying the database.
+    if (
+        typeof name !== "string" ||
+        name.length < 1 ||
+        name.length > 50 ||
+        typeof pass !== "string" ||
+        pass.length === 0 ||
+        Buffer.byteLength(pass, "utf8") > 1024
+    ) {
+        return callback(authenticationError(), null);
+    }
+
+    try {
+        const sql = `
+            SELECT id, username, email, password_hash
+            FROM users
+            WHERE username = $1
+            LIMIT 1
+        `;
+
+        const result = await pool.query(sql, [name]);
+
+        // User does not exist.
+        if (result.rows.length === 0) {
+            const dummyHash = await dummyHashPromise;
+            await argon2.verify(dummyHash, pass);
+
+            return callback(authenticationError(), null);
         }
-    });
 
+        const user = result.rows[0];
+
+        // Verify the supplied password against the stored hash.
+        const passwordMatches = await argon2.verify(
+            user.password_hash,
+            pass
+        );
+
+        if (!passwordMatches) {
+            return callback(authenticationError(), null);
+        }
+
+        // Authentication successful.
+        // Never expose password hashes.
+        return callback(null, {
+            id: user.id,
+            username: user.username,
+            email: user.email
+        });
+
+    } catch (err) {
+        console.error("Login database error:", {
+            code: err.code || "UNKNOWN"
+        });
+
+        const error = new Error(
+            "Authentication service unavailable"
+        );
+        error.code = "AUTH_SERVICE_ERROR";
+
+        return callback(error, null);
+    }
+}
+
+/**
+ * Register a new user.
+ *
+ * @param {Array} params - [username, password, email]
+ * @param {function} callback - callback(error, user)
+ */
+async function registerUser(params, callback) {
+    if (typeof callback !== "function") {
+        throw new TypeError("Callback must be a function");
+    }
+
+    if (!Array.isArray(params) || params.length !== 3) {
+        return callback(
+            new Error("Invalid registration parameters"),
+            null
+        );
+    }
+
+    const [username, password, email] = params;
+
+    // Validate username.
+    if (
+        typeof username !== "string" ||
+        username.length < 3 ||
+        username.length > 50 ||
+        !/^[a-zA-Z0-9_-]+$/.test(username)
+    ) {
+        return callback(
+            new Error("Invalid username"),
+            null
+        );
+    }
+
+    // Validate password.
+    if (
+        typeof password !== "string" ||
+        Buffer.byteLength(password, "utf8") < 12 ||
+        Buffer.byteLength(password, "utf8") > 1024
+    ) {
+        return callback(
+            new Error("Password must be at least 12 characters"),
+            null
+        );
+    }
+
+    // Validate email.
+    if (
+        typeof email !== "string" ||
+        email.length > 254 ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    ) {
+        return callback(
+            new Error("Invalid email address"),
+            null
+        );
+    }
+
+    try {
+        // Securely hash the password before storing it.
+        const passwordHash = await argon2.hash(
+            password,
+            hashOptions
+        );
+
+        const sql = `
+            INSERT INTO users (
+                username,
+                password_hash,
+                email
+            )
+            VALUES ($1, $2, $3)
+            RETURNING id, username, email
+        `;
+
+        const result = await pool.query(sql, [
+            username,
+            passwordHash,
+            email
+        ]);
+
+        // Registration successful.
+        return callback(null, result.rows[0]);
+
+    } catch (err) {
+        // PostgreSQL unique constraint violation.
+        if (err.code === "23505") {
+            const error = new Error(
+                "Username or email already exists"
+            );
+            error.code = "USER_EXISTS";
+
+            return callback(error, null);
+        }
+
+        console.error("Registration database error:", {
+            code: err.code || "UNKNOWN"
+        });
+
+        const error = new Error(
+            "Registration service unavailable"
+        );
+        error.code = "REGISTRATION_ERROR";
+
+        return callback(error, null);
+    }
 }
 
 module.exports = {
-    handleLogin: handleLogin,
-    registerUser: registerUser
+    handleLogin,
+    registerUser
 };
